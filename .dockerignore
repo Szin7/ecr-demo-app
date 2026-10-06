@@ -1,0 +1,10 @@
+cat > .dockerignore <<'EOF'
+.git
+.github
+__pycache__
+*.pyc
+.venv
+venv
+.env
+README.md
+EOF
