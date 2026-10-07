@@ -1,4 +1,135 @@
-name: Build and Push Docker Image to ECR
+  deploy-to-ec2:
+    name: Deploy to EC2 over SSH
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: ap-south-1
+      ECR_REPOSITORY: ecr-demo-app
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_SG_ID: ${{ vars.EC2_SG_ID }}
+      EC2_USER: ec2-user
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Prepare SSH private key
+        env:
+          SSH_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/ec2_key
+          chmod 600 ~/.ssh/ec2_key
+
+      - name: Temporarily allow runner SSH access
+        id: allow-ssh
+        run: |
+          set -euo pipefail
+
+          IP=$(curl -fsSL https://checkip.amazonaws.com | tr -d '\r\n')
+
+          [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]
+
+          CIDR="${IP}/32"
+          echo "cidr=$CIDR" >> "$GITHUB_OUTPUT"
+
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$EC2_SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$CIDR"
+
+          sleep 10
+
+      - name: Verify EC2 SSH host key
+        env:
+          EXPECTED: ${{ vars.EC2_SSH_FINGERPRINT }}
+        run: |
+          set -euo pipefail
+
+          HOST_KEY=$(ssh-keyscan -T 10 -t ed25519 "$EC2_HOST" 2>/dev/null)
+          test -n "$HOST_KEY"
+
+          ACTUAL=$(printf '%s\n' "$HOST_KEY" | ssh-keygen -lf - | awk '{print $2}')
+
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "EC2 SSH host fingerprint mismatch"
+            exit 1
+          fi
+
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+
+      - name: Pull image and deploy to EC2
+        run: |
+          set -euo pipefail
+
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          IMAGE="${REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+
+          SSH_OPTS=(
+            -i "$HOME/.ssh/ec2_key"
+            -o StrictHostKeyChecking=yes
+            -o BatchMode=yes
+            -o ConnectTimeout=20
+          )
+
+          aws ecr get-login-password --region "$AWS_REGION" |
+            ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" \
+              "sudo docker login --username AWS --password-stdin '$REGISTRY'"
+
+          ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" \
+            "sudo docker pull '$IMAGE'"
+
+          ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" \
+            "sudo docker logout '$REGISTRY'"
+
+          ssh "${SSH_OPTS[@]}" "$EC2_USER@$EC2_HOST" bash -se -- "$IMAGE" <<'REMOTE'
+          set -euo pipefail
+
+          IMAGE="$1"
+
+          sudo docker rm -f ecr-demo-app 2>/dev/null || true
+
+          sudo docker run -d \
+            --restart unless-stopped \
+            --name ecr-demo-app \
+            -p 80:5000 \
+            "$IMAGE"
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1/health; then
+              echo "Deployment healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          sudo docker logs ecr-demo-app
+          exit 1
+          REMOTE
+
+      - name: Remove temporary SSH access
+        if: ${{ always() && steps.allow-ssh.outputs.cidr != '' }}
+        env:
+          CIDR: ${{ steps.allow-ssh.outputs.cidr }}
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$EC2_SG_ID" \
+            --protocol tcp \
+            --port 22 \
+            --cidr "$CIDR"
+
+      - name: Remove local SSH key
+        if: always()
+        run: rm -f ~/.ssh/ec2_keyname: Build and Push Docker Image to ECR
 
 on:
   push:
