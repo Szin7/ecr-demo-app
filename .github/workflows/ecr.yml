@@ -1,4 +1,5 @@
-name: Build and Push Docker Image to ECR
+name: AWS Docker CI/CD Pipeline
+run-name: Build and Deploy Flask App to EC2
 
 on:
   push:
